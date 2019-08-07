@@ -57,6 +57,9 @@ type Controller struct {
 	capacityTargetLister  shipperlisters.CapacityTargetLister
 	capacityTargetsSynced cache.InformerSynced
 
+	rolloutBlockLister shipperlisters.RolloutBlockLister
+	rolloutBlockSynced cache.InformerSynced
+
 	releaseWorkqueue     workqueue.RateLimitingInterface
 	applicationWorkqueue workqueue.RateLimitingInterface
 
@@ -91,6 +94,7 @@ func NewController(
 	installationTargetInformer := informerFactory.Shipper().V1alpha1().InstallationTargets()
 	trafficTargetInformer := informerFactory.Shipper().V1alpha1().TrafficTargets()
 	capacityTargetInformer := informerFactory.Shipper().V1alpha1().CapacityTargets()
+	rolloutBlockInformer := informerFactory.Shipper().V1alpha1().RolloutBlocks()
 
 	glog.Info("Building a release controller")
 
@@ -115,6 +119,9 @@ func NewController(
 		capacityTargetLister:  capacityTargetInformer.Lister(),
 		capacityTargetsSynced: capacityTargetInformer.Informer().HasSynced,
 
+		rolloutBlockLister: rolloutBlockInformer.Lister(),
+		rolloutBlockSynced: rolloutBlockInformer.Informer().HasSynced,
+
 		releaseWorkqueue: workqueue.NewNamedRateLimitingQueue(
 			workqueue.DefaultControllerRateLimiter(),
 			"release_controller_releases",
@@ -135,7 +142,7 @@ func NewController(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: controller.enqueueRelease,
 			UpdateFunc: func(oldObj, newObj interface{}) {
-				controller.enqueueRelease(newObj)
+				controller.enqueueReleaseRateLimited(newObj)
 			},
 			DeleteFunc: controller.enqueueAppFromRelease,
 		})
@@ -187,6 +194,7 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) {
 		c.installationTargetsSynced,
 		c.trafficTargetsSynced,
 		c.capacityTargetsSynced,
+		c.rolloutBlockSynced,
 	); !ok {
 		runtime.HandleError(fmt.Errorf("failed to wait for caches to sync"))
 		return
@@ -292,6 +300,7 @@ func (c *Controller) syncOneReleaseHandler(key string) error {
 		c.installationTargetLister,
 		c.capacityTargetLister,
 		c.trafficTargetLister,
+		c.rolloutBlockLister,
 		c.chartFetcher,
 		c.recorder,
 	)
@@ -435,6 +444,22 @@ func (c *Controller) enqueueRelease(obj interface{}) {
 	c.releaseWorkqueue.Add(key)
 }
 
+func (c *Controller) enqueueReleaseRateLimited(obj interface{}) {
+	rel, ok := obj.(*shipper.Release)
+	if !ok {
+		runtime.HandleError(fmt.Errorf("not a shipper.Release: %#v", obj))
+		return
+	}
+
+	key, err := cache.MetaNamespaceKeyFunc(rel)
+	if err != nil {
+		runtime.HandleError(err)
+		return
+	}
+
+	c.releaseWorkqueue.AddRateLimited(key)
+}
+
 func (c *Controller) enqueueAppFromRelease(obj interface{}) {
 	rel, ok := obj.(*shipper.Release)
 	if !ok {
@@ -517,6 +542,10 @@ func reasonForReleaseCondition(err error) string {
 		return "BrokenChartSpec"
 	case shippererrors.WrongChartDeploymentsError:
 		return "WrongChartDeployments"
+	case shippererrors.InvalidRolloutBlockOverrideError:
+		return "InvalidRolloutBlockOverride"
+	case shippererrors.RolloutBlockError:
+		return "RolloutBlock"
 	}
 
 	if shippererrors.IsKubeclientError(err) {
