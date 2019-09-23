@@ -324,6 +324,30 @@ func (c *Controller) syncOneReleaseHandler(key string) error {
 		c.recorder,
 	)
 
+	canSchedule, err := scheduler.CanScheduleRelease(rel.DeepCopy())
+	if canSchedule {
+		condition := releaseutil.NewReleaseCondition(
+			shipper.ReleaseConditionTypeBlocked,
+			corev1.ConditionFalse,
+			"",
+			"",
+		)
+		releaseutil.SetReleaseCondition(&initialRel.Status, *condition)
+	} else {
+		condition := releaseutil.NewReleaseCondition(
+			shipper.ReleaseConditionTypeBlocked,
+			corev1.ConditionTrue,
+			shipper.RolloutBlockReason,
+			err.Error(),
+		)
+		releaseutil.SetReleaseCondition(&initialRel.Status, *condition)
+
+		if _, err := c.clientset.ShipperV1alpha1().Releases(namespace).Update(initialRel); err != nil {
+			return shippererrors.NewKubeclientUpdateError(initialRel, err)
+		}
+		return err
+	}
+
 	if !releaseHasClusters(rel) {
 		shouldForce := false
 		rel, err = scheduler.ChooseClusters(rel.DeepCopy(), shouldForce)
